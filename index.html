@@ -67,6 +67,7 @@
     <h2>Receipt trail — everything the box did</h2>
     <div id="receipts"></div>
     <h2 style="margin-top:20px;">Inside the box right now</h2>
+    <div style="font-size:13px; opacity:.8; margin-bottom:6px;">This panel obeys the same rules as the agent: switch to Visitor and a Keeper-only memory hides itself here too.</div>
     <div id="memories"></div>
   </section>
 </main>
@@ -93,18 +94,22 @@ async function post(path, body) {
   const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
   return r.json();
 }
-function backendLabel(b) {
-  if (b === 'atlas') return 'MongoDB Atlas (cloud)';
-  if (b === 'atlas-storage-local-rank') return 'MongoDB Atlas (cloud) — search done on this laptop';
-  return 'this laptop';
+function backendLabel(st) {
+  if (st.backend === 'local') return 'this laptop';
+  const base = 'MongoDB Atlas (cloud)';
+  if (st.backend === 'atlas-storage-local-rank') return base + ' — search done on this laptop';
+  const ls = st.last_search;
+  if (ls && ls.path === 'exact') return base + ' — last answer: exact match';
+  if (ls && ls.scored_locally && ls.scored_locally.length) return base + ' — fresh memory ranked on this laptop';
+  return base;
 }
 function render(st) {
-  $('backend').textContent = 'Memory box: ' + backendLabel(st.backend) + ' · run #' + st.run;
+  $('backend').textContent = 'Memory box: ' + backendLabel(st) + ' · run #' + st.run;
   $('receipts').innerHTML = st.receipts.map(r =>
     `<div class="receipt ${r.op}"><b>#${r.n} ${r.op}</b> [${r.ts}] (${r.actor})\n${r.detail}</div>`).join('');
   $('right').scrollTop = $('right').scrollHeight;
   $('memories').innerHTML = st.memories.map(m =>
-    `<div class="mem">#${m.id} [${m.key}] <span class="st">${m.status}</span> — ${m.status==='forgotten' ? '«content deleted»' : '"' + (m.text||'') + '"'} · readable by: ${m.readers.join(', ')}</div>`).join('') || '<div class="mem">empty</div>';
+    `<div class="mem">#${m.id} [${m.key}] <span class="st">${m.status}</span> — ${m.status==='forgotten' ? '«content deleted»' : (m.hidden ? '🔒 hidden — its rule doesn\'t include you' : '"' + (m.text||'') + '"')} · readable by: ${m.readers.join(', ')}</div>`).join('') || '<div class="mem">empty</div>';
 }
 function addMsg(cls, who, text) {
   const d = document.createElement('div');
@@ -123,6 +128,10 @@ async function say(text) {
 $('send').onclick = () => { const v = $('input').value.trim(); if (v) { say(v); $('input').value=''; } };
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter') $('send').click(); });
 document.querySelectorAll('[data-say]').forEach(b => b.onclick = () => say(b.dataset.say));
+$('actor').addEventListener('change', async () => {
+  const st = await (await fetch('/api/state?actor=' + $('actor').value)).json();
+  render(st);
+});
 $('newrun').onclick = async () => {
   const r = await post('/api/newrun', {actor: $('actor').value});
   addMsg('agent', 'Hermes', r.reply);
@@ -147,7 +156,7 @@ $('uselocal').onclick = async () => {
   $('atlasmsg').textContent = r.message;
   if (r.ok) render(r.state);
 };
-fetch('/api/state').then(r => r.json()).then(st => {
+fetch('/api/state?actor=' + $('actor').value).then(r => r.json()).then(st => {
   render(st);
   addMsg('agent', 'Hermes', "Hello. I'm a small agent with a memory box behind me. Tell me to remember something — or ask me what the client's budget is, and watch what happens when the box is empty.");
 });

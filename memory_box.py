@@ -110,6 +110,7 @@ class MemoryBox:
         self.store_path = store_path
         self.memories = []   # list of dicts (includes tombstones)
         self.receipts = []   # list of dicts {n, ts, op, actor, detail}
+        self.last_search = None  # per-query record of how retrieval was served
         self.backend = "local"
         self._atlas = None
         uri = atlas_uri
@@ -224,6 +225,19 @@ class MemoryBox:
         self._expire_pass(actor)
         readers = readers or ["keeper"]
         key = topic_key(text)
+        # The card governs STORING OVER, too: if an active memory already
+        # holds this topic and its rule doesn't name this actor, a fresh
+        # "Remember" may not plant a rival version beside it (audit,
+        # Nov 14: a visitor could otherwise poison the keeper's topic —
+        # the change-lock had a hole beside the correct() gate).
+        clash = [m for m in self._active() if m["key"] == key]
+        if clash and actor not in clash[0]["readers"]:
+            self._receipt("REFUSED", actor,
+                          "%s tried to store over memory #%d (%s) — rule "
+                          "says changeable by: %s. Refused."
+                          % (actor, clash[0]["id"], clash[0]["key"],
+                             ", ".join(clash[0]["readers"])))
+            return None
         mem = {"id": (max([m["id"] for m in self.memories], default=0) + 1),
                "key": key, "text": text, "embedding": embed(text),
                "readers": readers, "status": "active",
@@ -233,10 +247,50 @@ class MemoryBox:
         self._persist_memory(mem)
         rule = "readable by: " + ", ".join(readers)
         life = ("lifetime: %ds" % ttl_seconds) if ttl_seconds else "no expiry"
+        note = ""
+        if self._atlas is not None:
+            # Read-your-write, proven on the receipt: wait (bounded) until
+            # the Atlas search index can actually see the new memory, and
+            # say how long it took. The index is asynchronous — this poll
+            # is the honest fix; the merge in _rank is the backstop.
+            found, secs = self._await_indexed(mem)
+            if found:
+                note = " Searchable in Atlas after %.1fs." % secs
+            else:
+                note = (" Not indexed after %.1fs — served from the "
+                        "overlay until it is." % secs)
         self._receipt("STORE", actor,
-                      "Memory #%d stored: \"%s\" (%s; %s)"
-                      % (mem["id"], text, rule, life))
+                      "Memory #%d stored: \"%s\" (%s; %s)%s"
+                      % (mem["id"], text, rule, life, note))
         return mem
+
+    def _await_indexed(self, mem, budget=3.0):
+        """Poll $vectorSearch with the memory's own embedding until its
+        id shows up in the index, or the budget runs out.
+        Returns (found, seconds_spent)."""
+        if self._atlas is None:
+            return (False, 0.0)
+        start = time.time()
+        deadline = start + budget
+        while True:
+            try:
+                pipeline = [
+                    {"$vectorSearch": {
+                        "index": VECTOR_INDEX_NAME,
+                        "path": "embedding",
+                        "queryVector": mem["embedding"],
+                        "exact": True,
+                        "limit": max(10, len(self._active())),
+                        "filter": {"status": "active", "kind": "memory"}}},
+                    {"$project": {"id": 1}}]
+                ids = [d["id"] for d in self._atlas.aggregate(pipeline)]
+                if mem["id"] in ids:
+                    return (True, time.time() - start)
+            except Exception:
+                return (False, time.time() - start)
+            if time.time() >= deadline:
+                return (False, time.time() - start)
+            time.sleep(0.25)
 
     def correct(self, text, actor="keeper"):
         """A correction supersedes the active memory with the same key.
@@ -309,9 +363,18 @@ class MemoryBox:
     # ------------------------------------------------------------- retrieval
     def _rank(self, query):
         """Return [(score, memory)] over active memories, best first.
-        Uses Atlas $vectorSearch when available; otherwise local cosine."""
+        Atlas $vectorSearch ranks what the index has; memories too fresh
+        for the index are scored locally and MERGED in (the overlay) —
+        the index is asynchronous (lag seen live Nov 13), so absence
+        from the hits means 'not indexed yet', never 'doesn't exist'.
+        exact:True makes that sound at this scale: a memory missing
+        from the hits is missing because it is unindexed, not because
+        it was out-ranked. last_search records which path served what,
+        so the page label can say so per query."""
         act = self._active()
         if not act:
+            self.last_search = {"path": "none", "from_index": 0,
+                                "scored_locally": []}
             return []
         qv = embed(query)
         if self._atlas is not None:
@@ -321,37 +384,36 @@ class MemoryBox:
                         "index": VECTOR_INDEX_NAME,
                         "path": "embedding",
                         "queryVector": qv,
-                        "numCandidates": 50, "limit": 10,
+                        "exact": True,
+                        "limit": max(10, len(act)),
                         "filter": {"status": "active", "kind": "memory"}}},
                     {"$project": {"id": 1, "score": {"$meta": "vectorSearchScore"}}}]
                 # Atlas cosine score is (1+cos)/2 — convert back to cosine
                 # so the threshold and receipts mean the same as local.
                 hits = {d["id"]: 2 * d["score"] - 1
                         for d in self._atlas.aggregate(pipeline)}
-                if hits:
-                    # Index-lag guard (seen live Nov 13): Atlas Search
-                    # indexes new docs asynchronously, so a memory stored
-                    # seconds ago can be MISSING from $vectorSearch hits
-                    # while local cosine over the same stored embeddings
-                    # scores it well above threshold. If the local best
-                    # is missing from the hits, serve the local ranking
-                    # rather than answering "I don't know" on stage.
-                    local = sorted(
-                        [(cosine(qv, m["embedding"]), m) for m in act],
-                        key=lambda x: x[0], reverse=True)
-                    if (local and local[0][0] >= SIM_THRESHOLD
-                            and local[0][1]["id"] not in hits):
-                        return local
-                    self.backend = "atlas"
-                    by_id = {m["id"]: m for m in act}
-                    return sorted([(hits[m["id"]], by_id[m["id"]])
-                                    for m in hits if m["id"] in by_id],
-                                   reverse=True)
+                by_id = {m["id"]: m for m in act}
+                # Stale hits (forgotten / superseded since indexing) are
+                # dropped against the collection — the collection is the
+                # authority, the index only a candidate generator.
+                ranked = [(hits[i], by_id[i]) for i in hits if i in by_id]
+                fresh = [m for m in act if m["id"] not in hits]
+                ranked += [(cosine(qv, m["embedding"]), m) for m in fresh]
+                ranked.sort(key=lambda x: x[0], reverse=True)
+                self.backend = "atlas"
+                self.last_search = {
+                    "path": "atlas" if not fresh else "atlas+overlay",
+                    "from_index": len(ranked) - len(fresh),
+                    "scored_locally": [m["id"] for m in fresh]}
+                return ranked
             except Exception:
                 # No vector index yet -> honest local ranking over Atlas docs.
                 self.backend = "atlas-storage-local-rank"
-        return sorted([(cosine(qv, m["embedding"]), m) for m in act],
-                      key=lambda x: x[0], reverse=True)
+        ranked = sorted([(cosine(qv, m["embedding"]), m) for m in act],
+                        key=lambda x: x[0], reverse=True)
+        self.last_search = {"path": "local", "from_index": 0,
+                            "scored_locally": [m["id"] for m in act]}
+        return ranked
 
     _STOP = {"the", "a", "an", "is", "for", "of", "what", "whats", "s"}
 
@@ -382,6 +444,8 @@ class MemoryBox:
         self._expire_pass(actor)
         exact = self._exact_match(query)
         if exact is not None:
+            self.last_search = {"path": "exact", "from_index": 0,
+                                "scored_locally": []}
             ranked = [(1.0, exact)]
         else:
             ranked = self._rank(query)
@@ -429,15 +493,22 @@ class Agent:
         if m:
             ttl, fact = int(m.group(1)), m.group(2)
             fact = t[t.index(":") + 1:].strip()
-            self.box.store(fact, actor=actor, readers=["keeper", "visitor"],
-                           ttl_seconds=ttl)
+            stored = self.box.store(fact, actor=actor,
+                                    readers=["keeper", "visitor"],
+                                    ttl_seconds=ttl)
+            if stored is None:
+                return ("I have a memory about that, but its rule says "
+                        "only the Keeper can change it. I can't do that.")
             return ("Stored for %d seconds: \"%s\". After that, it's gone "
                     "and I stop answering it." % (ttl, fact))
 
         if low.startswith("remember"):
             fact = t.split(":", 1)[1].strip() if ":" in t else \
                 re.sub(r"^remember\s+", "", t, flags=re.I)
-            self.box.store(fact, actor=actor, readers=["keeper"])
+            stored = self.box.store(fact, actor=actor, readers=["keeper"])
+            if stored is None:
+                return ("I have a memory about that, but its rule says "
+                        "only the Keeper can change it. I can't do that.")
             return ("Stored, with a receipt. Rule on it: only the Keeper "
                     "(you) can read it back.")
 

@@ -63,7 +63,7 @@ on this laptop", or "this laptop".
 python3 test_demo.py
 ```
 
-Result, Sat Nov 14, 2026: **14 tests, all passing** — one per beat
+Result, Sat Nov 14, 2026: **18 tests, all passing** — one per beat
 plus persistence-across-restart, a regression guard that an unrelated
 memory is never served as the answer to a question it doesn't match,
 and the change-lock tests: a visitor can neither correct nor forget a

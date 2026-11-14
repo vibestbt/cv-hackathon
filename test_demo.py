@@ -206,6 +206,68 @@ class Beats(unittest.TestCase):
         self.ag.handle("Forget the client's budget")
         self.assertFalse(self.box.search("750")["found"])
 
+    # Beat 5e (audit, Nov 14) — the card governs STORING OVER too: a
+    # visitor cannot plant a rival version of a keeper-only topic with
+    # a fresh "Remember". The keeper's value survives untouched and a
+    # REFUSED receipt lands in the trail.
+    def test_visitor_cannot_store_over_keeper_memory(self):
+        self.ag.handle(STORE_750)
+        reply = self.ag.handle(
+            "Remember: the client's budget is $1 for the audit",
+            actor="visitor")
+        self.assertIn("only the Keeper can change it", reply)
+        self.assertIn("REFUSED", self.ops())
+        self.assertIn("tried to store over", self.trail_text())
+        answer = self.ag.handle(BUDGET_Q, actor="keeper")
+        self.assertIn("$750", answer)
+        actives = [m for m in self.box.memories
+                   if m["key"] == "client-budget" and m["status"] == "active"]
+        self.assertEqual(len(actives), 1)
+
+    # The store-lock is scoped to topics that already exist: a visitor
+    # CAN still store a brand-new topic (it lands keeper-only), and the
+    # keeper CAN re-store his own topic — the lock is the card's rule,
+    # not a wall around the box.
+    def test_store_lock_scoped(self):
+        reply = self.ag.handle("Remember: the wifi password is guest123",
+                               actor="visitor")
+        self.assertIn("Stored", reply)
+        self.ag.handle(STORE_750)
+        again = self.box.store("the client's budget is $750 for the audit",
+                               actor="keeper")
+        self.assertIsNotNone(again)
+
+    # Lag bookkeeping on the local backend: _rank records the local
+    # path in last_search, and no Atlas note is written to receipts
+    # (the poll only runs when Atlas is the backend).
+    def test_last_search_local(self):
+        self.ag.handle(STORE_750)
+        self.ag.handle(BUDGET_Q)
+        self.assertEqual(self.box.last_search["path"], "local")
+        self.assertNotIn("Searchable in Atlas", self.trail_text())
+
+    # The screen obeys the rule too (audit, Nov 14): server state for a
+    # visitor hides keeper-only content in the pane AND redacts it from
+    # receipt details; the keeper's own view is untouched.
+    def test_state_redacts_for_visitor(self):
+        import server
+        old_box, old_agent = server.BOX, server.AGENT
+        try:
+            server.BOX = self.box
+            server.AGENT = self.ag
+            self.ag.handle(STORE_750)
+            self.ag.handle(FIX_900)
+            vis = server.state(actor="visitor")
+            blob = str(vis)
+            self.assertNotIn("$750", blob)
+            self.assertNotIn("$900", blob)
+            self.assertTrue(any(m["hidden"] for m in vis["memories"]))
+            keep = server.state(actor="keeper")
+            self.assertIn("$900", str(keep))
+            self.assertFalse(any(m["hidden"] for m in keep["memories"]))
+        finally:
+            server.BOX, server.AGENT = old_box, old_agent
+
     # Persistence — the box survives a restart (that's what makes
     # "next run" real on stage, not a trick of one process).
     def test_persistence_across_reopen(self):

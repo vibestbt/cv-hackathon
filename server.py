@@ -12,7 +12,9 @@ backend is live, honestly.
 """
 import json
 import os
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 from memory_box import MemoryBox, Agent
 
@@ -21,16 +23,50 @@ BOX = MemoryBox()
 AGENT = Agent(BOX)
 
 
-def state():
+def _protected_tokens(texts):
+    """Everything a redaction must catch: the full protected texts plus
+    the value tokens inside them ($ amounts, 3+-digit numbers) — a
+    receipt may quote just the value ('$750' -> '$900')."""
+    toks = set()
+    for t in texts:
+        toks.add(t)
+        toks.update(re.findall(r"\$\s?\d[\d,]*|\b\d{3,}\b", t))
+    return sorted(toks, key=len, reverse=True)
+
+
+def _redact(actor, s):
+    """Redact every trace of content the actor may not read from a
+    string (a receipt detail, a reply fragment)."""
+    protected = [m["text"] for m in BOX.memories
+                 if m["status"] != "forgotten" and m.get("text")
+                 and actor not in m["readers"]]
+    out = s
+    for tok in _protected_tokens(protected):
+        out = out.replace(tok, "•••")
+    return out
+
+
+def state(actor="keeper"):
+    """The page state AS THIS ACTOR may see it. The right-hand pane is
+    the Keeper's console, but it renders for whoever is asking: a
+    memory whose rule doesn't name the actor is hidden in the pane,
+    and receipt details that quote its content are redacted — the
+    screen obeys the same rule the agent does (audit, Nov 14)."""
     mems = []
     for m in BOX.memories:
+        hidden = (m["status"] != "forgotten" and actor not in m["readers"])
         mems.append({
             "id": m["id"], "key": m["key"], "status": m["status"],
-            "text": m["text"] if m["status"] != "forgotten" else None,
+            "text": None if (hidden or m["status"] == "forgotten")
+                    else m["text"],
+            "hidden": hidden,
             "readers": m["readers"],
             "expires_at": m.get("expires_at")})
-    return {"backend": BOX.backend, "run": AGENT.run,
-            "memories": mems, "receipts": BOX.receipts}
+    receipts = [dict(r, detail=_redact(actor, r["detail"]))
+                for r in BOX.receipts]
+    return {"backend": BOX.backend, "run": AGENT.run, "actor": actor,
+            "last_search": BOX.last_search,
+            "memories": mems, "receipts": receipts}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -58,8 +94,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/api/state":
-            self._json(state())
+        elif self.path.startswith("/api/state"):
+            actor = parse_qs(urlparse(self.path).query).get(
+                "actor", ["keeper"])[0]
+            self._json(state(actor))
         else:
             self._json({"error": "not found"}, 404)
 
@@ -71,21 +109,27 @@ class Handler(BaseHTTPRequestHandler):
             before = len(BOX.receipts)
             reply = AGENT.handle(data.get("text", ""), actor=actor)
             self._json({"reply": reply,
-                        "new_receipts": BOX.receipts[before:],
-                        "state": state()})
+                        "new_receipts": [dict(r, detail=_redact(
+                            actor, r["detail"]))
+                            for r in BOX.receipts[before:]],
+                        "state": state(actor)})
         elif self.path == "/api/newrun":
             before = len(BOX.receipts)
             reply = AGENT.new_run(actor=actor)
             self._json({"reply": reply,
-                        "new_receipts": BOX.receipts[before:],
-                        "state": state()})
+                        "new_receipts": [dict(r, detail=_redact(
+                            actor, r["detail"]))
+                            for r in BOX.receipts[before:]],
+                        "state": state(actor)})
         elif self.path == "/api/search":
             before = len(BOX.receipts)
             res = BOX.search(data.get("query", ""), actor=actor)
             out = {"found": res["found"], "denied": res["denied"],
                    "text": res["memory"]["text"] if res["memory"] else None,
-                   "new_receipts": BOX.receipts[before:],
-                   "state": state()}
+                   "new_receipts": [dict(r, detail=_redact(
+                       actor, r["detail"]))
+                       for r in BOX.receipts[before:]],
+                   "state": state(actor)}
             self._json(out)
         elif self.path == "/api/reset":
             BOX.wipe()
