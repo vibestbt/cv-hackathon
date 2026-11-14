@@ -13,10 +13,11 @@ derived from the actual operation.
 
 ## Run it — zero-code operation (by design)
 
-The operator never writes or reads code. **Double-click
-`START-DEMO.command`** in this folder (or `bash start.sh`) — it brings
-the demo up and opens it in the browser by itself. Under the hood it
-runs `python3 server.py` → http://localhost:8765 (PORT env overrides).
+The operator never writes or reads code. From this repo:
+`python3 server.py` → http://localhost:8765 (PORT env overrides) —
+open that address and the demo is up. (On the operator's own machine
+a double-click launcher runs the same command and opens the browser
+by itself.)
 
 Everything is driven from the page: plain-English chat, labelled
 buttons for every beat, a persona dropdown, "New run", "Reset
@@ -29,9 +30,6 @@ needed for the local version (Python 3 standard library only); the
 start file quietly installs the one Atlas driver (`pymongo`) itself,
 only when an Atlas setup exists.
 
-Practice script (exact words, exact clicks, Saturday plan):
-**[PRACTICE.md](PRACTICE.md)**.
-
 ## Backends — one config point
 
 Default: local file store (`memories.json`), retrieval ranked by local
@@ -41,7 +39,7 @@ One config point underneath: **`atlas_uri.txt`** in this folder — but
 the operator never edits it by hand; the page's "Connect to Atlas"
 writes it, only after a successful connection. With a string present
 at start, retrieval tries a real Atlas `$vectorSearch` (index
-`vector_index`, see PRACTICE.md step 2); if the index doesn't exist
+`vector_index`); if the index doesn't exist
 yet, data still lives in Atlas and ranking is done locally — the
 page's top-right corner always labels where the box lives, in plain
 words: "MongoDB Atlas (cloud)", "MongoDB Atlas (cloud) — search done
@@ -53,7 +51,8 @@ on this laptop", or "this laptop".
 2. **NEXT RUN** — a fresh run answers from the box; behaviour changed.
 3. **CORRECT** $750 → $900; old version superseded with a receipt.
 4. **EXPIRY** — a door code with a 20-second lifetime, honoured.
-5. **READ-RULE** — a second persona (visitor) is refused, on the record.
+5. **READ-RULE** — a second persona (visitor) is refused, on the record
+   — for reading AND for changing: the memory's card governs both.
 6. **FORGET + PROVE** — content hard-deleted (whole version chain);
    chat, direct search and vector search all return nothing, and the
    receipt trail itself is scrubbed of the forgotten content.
@@ -64,16 +63,19 @@ on this laptop", or "this laptop".
 python3 test_demo.py
 ```
 
-Result, Wed Nov 11, 2026: **8 tests, all passing** (2.4s) — one per beat
-plus persistence-across-restart and a regression guard that an unrelated
-memory is never served as the answer to a question it doesn't match.
-The page's two new endpoints were verified live the same evening: a
-bad connection string is refused with a plain-English message and
-nothing is saved; an unreachable cluster is refused the same way;
-"Use this laptop's box instead" switches the backend and reports it.
-(The Atlas-connect success path shares the constructor code exercised
-at startup; it gets its first live run against Larry's real cluster in
-tonight's practice, Step 2.)
+Result, Sat Nov 14, 2026: **14 tests, all passing** — one per beat
+plus persistence-across-restart, a regression guard that an unrelated
+memory is never served as the answer to a question it doesn't match,
+and the change-lock tests: a visitor can neither correct nor forget a
+keeper-only memory, while the Keeper corrects freely and a visitor can
+still correct a memory whose rule names the visitor.
+The Atlas path was verified live against the sandbox cluster
+(Nov 13-14): connect from the page, store, vector search, restart
+persistence, and a 15-point live battery through the page — all
+passing. A bad connection string is refused with a plain-English
+message and nothing is saved; an unreachable cluster is refused the
+same way; "Use this laptop's box instead" switches the backend and
+reports it.
 Two real bugs were found by testing the beats end-to-end and fixed
 before this was called done: forgetting originally left the superseded
 version's value quoted in the trail, and an expired memory's question
@@ -84,7 +86,5 @@ could be answered by an unrelated memory (similarity threshold too low).
 - `memory_box.py` — the box + agent (all logic, both backends)
 - `server.py` — stdlib web server + JSON API (chat, connect-to-Atlas, fallback switch)
 - `index.html` — the demo page (chat left, receipts right, labelled beat buttons, Atlas paste box)
-- `START-DEMO.command` / `start.sh` — the one double-click / one command that starts everything
 - `test_demo.py` — headless beat tests
-- `PRACTICE.md` — Larry's practice + Saturday runbook
-- `atlas_uri.txt` — (written by the app on a successful connect) the one config point; never commit it
+- `atlas_uri.txt` — local only, never committed: written by the app on a successful Atlas connect; the one config point
