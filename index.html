@@ -104,7 +104,7 @@ function backendLabel(st) {
   return base;
 }
 function render(st) {
-  $('backend').textContent = 'Memory box: ' + backendLabel(st) + ' · run #' + st.run;
+  $('backend').textContent = 'Memory box: ' + backendLabel(st) + ' · run #' + st.run + (st.talk ? ' · TALKING AGENT — talk in your own words' : '');
   $('receipts').innerHTML = st.receipts.map(r =>
     `<div class="receipt ${r.op}"><b>#${r.n} ${r.op}</b> [${r.ts}] (${r.actor})\n${r.detail}</div>`).join('');
   $('right').scrollTop = $('right').scrollHeight;

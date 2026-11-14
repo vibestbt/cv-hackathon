@@ -45,6 +45,22 @@ page's top-right corner always labels where the box lives, in plain
 words: "MongoDB Atlas (cloud)", "MongoDB Atlas (cloud) — search done
 on this laptop", or "this laptop".
 
+## Talk mode
+
+With `TALK_MODE=1` at start and an OpenRouter key in
+`openrouter_key.txt` (local only, never committed), the agent also
+takes plain-English instructions — "keep in mind the client's budget
+is $750", "please forget the client's budget" — and answers in
+ordinary sentences. A small model interprets and phrases; **the box
+still enforces every rule**, and the model is never given the content
+of a memory the asker may not read, so it cannot leak what it never
+saw. Questions about the agent's own model are deflected as outside
+its scope, by a deterministic guard that runs before the model is
+consulted. If the model is unreachable, the demo falls back to the
+classic path with no change in behaviour. Explicit
+`Remember:` / `Correct:` / `Forget:` inputs always take the classic
+path. Details: `TALK-MODE.md`.
+
 ## The six beats
 
 1. **STORE** a fact with a receipt + read-rule ("only the Keeper").
@@ -63,7 +79,8 @@ on this laptop", or "this laptop".
 python3 test_demo.py
 ```
 
-Result, Sat Nov 14, 2026: **18 tests, all passing** — one per beat
+Result, Sat Nov 14, 2026: **35 tests, all passing** (18 classic beat
+tests + 17 talk-mode tests) — one per beat
 plus persistence-across-restart, a regression guard that an unrelated
 memory is never served as the answer to a question it doesn't match,
 and the change-lock tests: a visitor can neither correct nor forget a
@@ -86,5 +103,7 @@ could be answered by an unrelated memory (similarity threshold too low).
 - `memory_box.py` — the box + agent (all logic, both backends)
 - `server.py` — stdlib web server + JSON API (chat, connect-to-Atlas, fallback switch)
 - `index.html` — the demo page (chat left, receipts right, labelled beat buttons, Atlas paste box)
+- `brain.py` — the talk-mode conversational layer (interpret + phrase; stdlib only, key read from `openrouter_key.txt`, never hardcoded)
+- `TALK-MODE.md` — how talk mode works and where its guard rails sit
 - `test_demo.py` — headless beat tests
 - `atlas_uri.txt` — local only, never committed: written by the app on a successful Atlas connect; the one config point

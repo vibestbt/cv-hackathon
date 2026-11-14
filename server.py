@@ -65,6 +65,7 @@ def state(actor="keeper"):
     receipts = [dict(r, detail=_redact(actor, r["detail"]))
                 for r in BOX.receipts]
     return {"backend": BOX.backend, "run": AGENT.run, "actor": actor,
+            "talk": bool(getattr(AGENT, "talk", False)),
             "last_search": BOX.last_search,
             "memories": mems, "receipts": receipts}
 

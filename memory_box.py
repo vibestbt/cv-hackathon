@@ -37,6 +37,11 @@ import os
 import re
 import time
 
+try:
+    import brain as _brain_mod
+except Exception:  # talk mode is optional; its absence changes nothing
+    _brain_mod = None
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCAL_STORE = os.path.join(HERE, "memories.json")
 ATLAS_URI_FILE = os.path.join(HERE, "atlas_uri.txt")
@@ -473,9 +478,28 @@ class Agent:
     questions from the box. Session state is ONLY the run counter — memory
     lives in the box, which is the whole point of 'next run'."""
 
-    def __init__(self, box):
+    def __init__(self, box, talk=None, brain=None):
         self.box = box
         self.run = 1
+        # Talk mode is OFF unless explicitly enabled (env TALK_MODE=1
+        # at server start, or talk=True). Off — or brain unavailable —
+        # the behaviour below is byte-identical to the classic demo.
+        if talk is None:
+            talk = os.environ.get("TALK_MODE") == "1"
+        self.talk = bool(talk)
+        self._brain = brain  # injected in tests; built lazily otherwise
+
+    def _get_brain(self):
+        """The talk brain if one can be built AND has a key, else None."""
+        if self._brain is not None:
+            return self._brain
+        if _brain_mod is None:
+            return None
+        br = _brain_mod.Brain()
+        if not br.available():
+            return None
+        self._brain = br
+        return br
 
     def new_run(self, actor="keeper"):
         self.run += 1
@@ -485,7 +509,249 @@ class Agent:
         return ("New run started (run #%d). I only know what's in my "
                 "memory box." % self.run)
 
+    # Inputs starting with these words are EXPLICIT commands and
+    # always take the classic path, even in talk mode — unchanged.
+    _CLASSIC_PREFIXES = ("remember", "correct", "forget", "search")
+
+    _CHAT_REPLY = ("I'm a little memory agent: I keep facts in a "
+                   "governed memory box — each one has rules for who "
+                   "can read it, how long it lives, and how it gets "
+                   "corrected or forgotten. Tell me a fact to remember, "
+                   "or ask me about one.")
+
+    # Identity rule (Larry, 2026-11-14): the agent NEVER names the
+    # model or provider behind it. Model-identity questions are
+    # deflected deterministically — before the brain is consulted —
+    # so no model slip is possible: questions about the DEMO are in
+    # scope (answered from knowledge), the engine underneath is not.
+    _IDENTITY_RE = re.compile(
+        r"(what|which|who)\b[^.?!]*\b(model|llm|engine|provider)\b|"
+        r"\b(are you|is this|you are|you're)\b[^.?!]*"
+        r"\b(claude|gpt|chatgpt|openai|anthropic|gemini|llama)\b|"
+        r"\b(claude|chatgpt|openai|anthropic|openrouter)\b[^.?!]*\?|"
+        r"\bpowered by\b|\bunderlying model\b|"
+        r"\bwho (made|built|created) you\b|"
+        r"\byour (model|maker|provider)\b", re.I)
+
+    _IDENTITY_REPLY = (
+        "That's outside my scope — I'm Hermes, the memory agent "
+        "for this demo, built by Larry Moi. What I can do is "
+        "remember facts under rules, answer from the box, correct, "
+        "expire, and forget — with a receipt for everything. "
+        "Try me.")
+
     def handle(self, text, actor="keeper"):
+        low = text.strip().lower()
+        if self._IDENTITY_RE.search(text):
+            return self._IDENTITY_REPLY
+        if self.talk and not low.startswith(self._CLASSIC_PREFIXES):
+            br = self._get_brain()
+            if br is not None:
+                try:
+                    topics = [m["key"] for m in self.box.memories
+                              if m["status"] == "active"]
+                    plan = br.interpret(text.strip(), topics=topics)
+                except Exception:
+                    # Brain failed BEFORE anything touched the box:
+                    # falling back to classic is always safe here.
+                    plan = None
+                if plan is not None:
+                    return self._execute_talk(br, plan, actor,
+                                              text.strip())
+        return self._handle_classic(text, actor)
+
+    def _find(self, box, query, text, actor):
+        """Layered retrieval for talk mode: the extracted query,
+        then the user's own words (the model may have paraphrased),
+        then a deterministic topic probe — if a word from an active
+        memory's key appears in the user's words, search that topic
+        directly. Returns the first found/denied search result, or
+        the last miss."""
+        res = box.search(query, actor=actor)
+        if (res["found"] or res["denied"]) or not text:
+            return res
+        res = box.search(text, actor=actor)
+        if res["found"] or res["denied"]:
+            return res
+        low = text.lower()
+        stop = {"the", "a", "an", "is", "are", "was", "were", "for",
+                "of", "to", "in", "on", "and", "or", "it", "its",
+                "this", "that"}
+        for m in box.memories:
+            if m["status"] != "active":
+                continue
+            # The topic phrase as it appears in the memory's own
+            # text (first two content words — "client's budget",
+            # "door code"). The key's words alone miss: "client"
+            # never matches the stored token "client's".
+            toks = [t.strip(".,!?\"'").lower()
+                    for t in m["text"].split()]
+            phrase = [t for t in toks
+                      if t.isalpha() or "'" in t]
+            phrase = [t for t in phrase if t not in stop][:2]
+            if phrase and any(w in low for w in phrase):
+                res3 = box.search(" ".join(phrase), actor=actor)
+                if res3["found"] or res3["denied"]:
+                    return res3
+        return res
+
+    def _execute_talk(self, br, plan, actor, text=""):
+        """Run the interpreted plan against the box — the box executes
+        deterministically and enforces every rule — then phrase ONLY
+        the outcome. A phrasing failure falls back to a deterministic
+        local phrasing of the same outcome (never a re-execution)."""
+        box = self.box
+        action = plan["action"]
+        if action == "chat":
+            # Memory before small talk: if the words match a stored
+            # memory, the box answers — the demo-knowledge step has
+            # no access to stored facts and must never improvise a
+            # don't-know over one (live bug, Nov 14: "so what was
+            # the budget again, i forgot" was routed to chat and
+            # answered from knowledge while the fact sat in the box).
+            if text and any(m["status"] == "active"
+                            for m in box.memories) and (
+                    "?" in text or re.search(
+                        r"\b(what|how much|when|did we|do we|"
+                        r"remind)\b", text.lower())):
+                res = self._find(box, text, text, actor)
+                if res["denied"]:
+                    return self._phrase_local(
+                        {"outcome": "denied",
+                         "detail": "A memory on that topic exists "
+                                   "but its rule limits reading "
+                                   "it to the Keeper."})
+                if res["found"]:
+                    found = {"outcome": "found",
+                             "fact": res["memory"]["text"],
+                             "detail": "This fact was just "
+                                       "retrieved from the "
+                                       "memory box."}
+                    try:
+                        return br.phrase(found)
+                    except Exception:
+                        return self._phrase_local(found)
+            # Questions about the demo are answered from the brain's
+            # demo knowledge; anything off-demo gets the scope
+            # deflection built into that prompt. Failure -> canned.
+            try:
+                return br.answer_demo(text)
+            except Exception:
+                return self._CHAT_REPLY
+        if action == "store":
+            fact, ttl = plan["fact"], plan["ttl_seconds"]
+            if ttl:
+                # Mirrors the classic door-code behaviour: a lifetime
+                # memory is readable by keeper + visitor.
+                stored = box.store(fact, actor=actor,
+                                   readers=["keeper", "visitor"],
+                                   ttl_seconds=ttl)
+            else:
+                stored = box.store(fact, actor=actor, readers=["keeper"])
+            result = ({"outcome": "change_refused",
+                       "detail": "A memory on that topic already "
+                                 "exists and its rule reserves "
+                                 "changes to the Keeper; nothing "
+                                 "was stored."}
+                      if stored is None
+                      else {"outcome": "stored", "fact": fact,
+                            "lifetime_seconds": ttl,
+                            "detail": "The fact was stored in the "
+                                      "memory box just now, with "
+                                      "a receipt."})
+        elif action == "correct":
+            new = box.correct(plan["fact"], actor=actor)
+            result = ({"outcome": "change_refused",
+                       "detail": "The memory's rule reserves "
+                                 "changes to the Keeper; nothing "
+                                 "was changed."}
+                      if new is None
+                      else {"outcome": "corrected",
+                            "fact": plan["fact"],
+                            "detail": "The old version was "
+                                      "superseded and the new "
+                                      "fact now answers."})
+        elif action == "forget":
+            fid = box.forget(plan["query"], actor=actor)
+            if fid == "refused":
+                result = {"outcome": "forget_refused",
+                          "detail": "The memory exists but its rule "
+                                    "reserves forgetting it to the "
+                                    "Keeper; nothing was deleted."}
+            elif fid is None:
+                result = {"outcome": "forget_not_found",
+                          "detail": "No memory matches that; "
+                                    "nothing was deleted."}
+            else:
+                result = {"outcome": "forgotten",
+                          "detail": "The memory WAS found and was "
+                                    "permanently deleted just "
+                                    "now. Confirm the deletion."}
+        else:  # ask
+            res = self._find(box, plan["query"], text, actor)
+            if res["denied"]:
+                # NOTE: no memory content in the outcome — the model
+                # cannot leak what it is never given.
+                result = {"outcome": "denied",
+                          "detail": "A memory on that topic exists "
+                                    "but its rule limits reading "
+                                    "it to the Keeper."}
+            elif not res["found"]:
+                result = {"outcome": "not_found",
+                          "detail": "No memory matches that "
+                                    "question; you don't know it."}
+            else:
+                result = {"outcome": "found",
+                          "fact": res["memory"]["text"],
+                          "detail": "This fact was just retrieved "
+                                    "from the memory box."}
+        # The rule/proof outcomes are phrased DETERMINISTICALLY —
+        # a deletion or a refusal must never be reworded into its
+        # opposite by the model (live bug, Nov 14: a successful
+        # forget was phrased as 'I do not have any memory of that').
+        if result["outcome"] in ("forgotten", "forget_refused",
+                                  "change_refused", "denied"):
+            return self._phrase_local(result)
+        try:
+            return br.phrase(result)
+        except Exception:
+            return self._phrase_local(result)
+
+    def _phrase_local(self, result):
+        """Deterministic phrasing of an operation outcome — the
+        fallback when the phrasing call itself fails."""
+        outcome = result["outcome"]
+        if outcome == "stored":
+            if result.get("lifetime_seconds"):
+                return ("Stored for %d seconds: \"%s\". After that, "
+                        "it's gone and I stop answering it."
+                        % (result["lifetime_seconds"], result["fact"]))
+            return ("Stored, with a receipt. Rule on it: only the "
+                    "Keeper (you) can read it back.")
+        if outcome == "corrected":
+            return ("Corrected. The old version is superseded — from "
+                    "now on I answer with the new one: \"%s\""
+                    % result["fact"])
+        if outcome == "change_refused":
+            return ("I have a memory about that, but its rule says "
+                    "only the Keeper can change it. I can't do that.")
+        if outcome == "forget_refused":
+            return ("I do have a memory about that, but only the "
+                    "Keeper can forget it. I can't do that.")
+        if outcome == "forgotten":
+            return ("Forgotten. The content is deleted — only a "
+                    "tombstone receipt remains.")
+        if outcome == "forget_not_found":
+            return "I couldn't find a memory matching that to forget."
+        if outcome == "denied":
+            return ("I do have a memory about that, but its rule says "
+                    "only the Keeper can read it. I can't tell you.")
+        if outcome == "found":
+            return "From my memory box: \"%s\"" % result["fact"]
+        return ("I don't know — there's nothing about that in my "
+                "memory box. (Run #%d)" % self.run)
+
+    def _handle_classic(self, text, actor="keeper"):
         t = text.strip()
         low = t.lower()
 
