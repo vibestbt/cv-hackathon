@@ -53,7 +53,7 @@ on this laptop", or "this laptop".
 4. **EXPIRY** — a door code with a 20-second lifetime, honoured.
 5. **READ-RULE** — a second persona (visitor) is refused, on the record
    — for reading AND for changing: the memory's card governs both.
-6. **FORGET + PROVE** — content hard-deleted (whole version chain);
+6. **FORGET + PROVE** — content hard-deleted (every version);
    chat, direct search and vector search all return nothing, and the
    receipt trail itself is scrubbed of the forgotten content.
 

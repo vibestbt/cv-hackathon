@@ -1,0 +1,4 @@
+atlas_uri.txt
+memories.json
+*.log
+__pycache__/
